@@ -1,0 +1,1185 @@
+<?php
+/**
+ * Loan Application Form Page
+ * File: index.php
+ */
+
+// Load environment variables from .env file
+function loadEnv($path) {
+    if (!file_exists($path)) {
+        die('.env file not found');
+    }
+
+    $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    foreach ($lines as $line) {
+        if (strpos(trim($line), '#') === 0) {
+            continue;
+        }
+
+        list($name, $value) = explode('=', $line, 2);
+        $name = trim($name);
+        $value = trim($value);
+
+        if (!array_key_exists($name, $_ENV)) {
+            putenv(sprintf('%s=%s', $name, $value));
+            $_ENV[$name] = $value;
+        }
+    }
+}
+
+// Load .env file
+loadEnv(__DIR__ . '/.env');
+
+// Start session
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
+// Get environment variables
+$environment = getenv('ENVIRONMENT') ?: 'UAT';
+$apiKey = getenv('API_KEY');
+
+// Database configuration from .env
+$dbHost = getenv('DB_HOST') ?: '82.25.121.2';
+$dbName = getenv('DB_NAME') ?: 'u527886566_vakilbetter676';
+$dbUser = getenv('DB_USER') ?: 'u527886566_vakilbetter676';
+$dbPass = getenv('DB_PASS') ?: 'VAKILr@6762';
+
+// Get API URLs based on environment
+if ($environment === 'PROD') {
+    $createLeadUrl = getenv('PROD_CREATE_LEAD_URL');
+    $getOffersUrl = getenv('PROD_GET_OFFERS_URL');
+} else {
+    $createLeadUrl = getenv('UAT_CREATE_LEAD_URL');
+    $getOffersUrl = getenv('UAT_GET_OFFERS_URL');
+}
+
+/**
+ * Database connection
+ */
+function getDBConnection() {
+    global $dbHost, $dbName, $dbUser, $dbPass;
+
+    try {
+        $pdo = new PDO("mysql:host=$dbHost;dbname=$dbName;charset=utf8mb4", $dbUser, $dbPass);
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        return $pdo;
+    } catch (PDOException $e) {
+        error_log("Database connection failed: " . $e->getMessage());
+        return null;
+    }
+}
+
+/**
+ * Save lead to database
+ */
+function saveLeadToDatabase($formData, $leadId, $apiResponse) {
+    try {
+        $pdo = getDBConnection();
+        if (!$pdo) {
+            return false;
+        }
+
+        $sql = "INSERT INTO leads (
+            lead_id, first_name, last_name, mobile_number, email, pan, dob,
+            pincode, monthly_income, loan_type, credit_score_class, employment_status,
+            employer_name, office_pincode, business_registration_type,
+            residence_type, business_turnover, business_years, business_account,
+            consumer_consent_ip, api_response, created_at
+        ) VALUES (
+            :lead_id, :first_name, :last_name, :mobile_number, :email, :pan, :dob,
+            :pincode, :monthly_income, :loan_type, :credit_score_class, :employment_status,
+            :employer_name, :office_pincode, :business_registration_type,
+            :residence_type, :business_turnover, :business_years, :business_account,
+            :consumer_consent_ip, :api_response, NOW()
+        )";
+
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([
+            ':lead_id' => $leadId,
+            ':first_name' => $formData['firstName'],
+            ':last_name' => $formData['lastName'],
+            ':mobile_number' => $formData['mobileNumber'],
+            ':email' => $formData['email'],
+            ':pan' => strtoupper($formData['pan']),
+            ':dob' => $formData['dob'],
+            ':pincode' => $formData['pincode'],
+            ':monthly_income' => $formData['monthlyIncome'],
+            ':loan_type' => $formData['loanType'] ?? null,
+            ':credit_score_class' => $formData['creditScoreClass'] ?? null,
+            ':employment_status' => $formData['employmentStatus'],
+            ':employer_name' => $formData['employerName'] ?? null,
+            ':office_pincode' => $formData['officePincode'] ?? null,
+            ':business_registration_type' => $formData['businessRegistrationType'] ?? null,
+            ':residence_type' => $formData['residenceType'] ?? null,
+            ':business_turnover' => $formData['businessCurrentTurnover'] ?? null,
+            ':business_years' => $formData['businessYears'] ?? null,
+            ':business_account' => $formData['businessAccount'] ?? null,
+            ':consumer_consent_ip' => getClientIP(),
+            ':api_response' => json_encode($apiResponse)
+        ]);
+
+        return true;
+    } catch (PDOException $e) {
+        error_log("Database save failed: " . $e->getMessage());
+        return false;
+    }
+}
+
+/**
+ * Make API request
+ */
+function makeApiRequest($url, $method = 'POST', $data = null) {
+    global $apiKey;
+
+    $headers = [
+        'apikey: ' . $apiKey,
+        'Content-Type: application/json'
+    ];
+
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+
+    if ($method === 'POST') {
+        curl_setopt($ch, CURLOPT_POST, true);
+        if ($data) {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+        }
+    }
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+
+    return [
+        'code' => $httpCode,
+        'response' => json_decode($response, true),
+        'raw_response' => $response,
+        'curl_error' => $curlError
+    ];
+}
+
+/**
+ * Get client IP address
+ */
+function getClientIP() {
+    $ipSources = [
+        'HTTP_CLIENT_IP',
+        'HTTP_X_FORWARDED_FOR',
+        'HTTP_X_FORWARDED',
+        'HTTP_X_CLUSTER_CLIENT_IP',
+        'HTTP_FORWARDED_FOR',
+        'HTTP_FORWARDED',
+        'REMOTE_ADDR'
+    ];
+
+    foreach ($ipSources as $source) {
+        if (!empty($_SERVER[$source])) {
+            $ip = $_SERVER[$source];
+            if (strpos($ip, ',') !== false) {
+                $ip = trim(explode(',', $ip)[0]);
+            }
+            $ip = trim($ip);
+            if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                if (!in_array($ip, ['127.0.0.1', '0.0.0.0', '::1'])) {
+                    return $ip;
+                }
+            }
+        }
+    }
+
+    // Try external IP detection
+    $services = ['https://api.ipify.org', 'https://icanhazip.com'];
+    foreach ($services as $service) {
+        try {
+            $ch = curl_init();
+            curl_setopt($ch, CURLOPT_URL, $service);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 3);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+
+            $ip = trim(curl_exec($ch));
+            curl_close($ch);
+
+            if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                return $ip;
+            }
+        } catch (Exception $e) {
+            continue;
+        }
+    }
+
+    return '8.8.8.8';
+}
+
+/**
+ * Create Lead API
+ */
+function createLead($formData) {
+    global $createLeadUrl;
+
+    $payload = [
+        'mobileNumber' => $formData['mobileNumber'],
+        'firstName' => $formData['firstName'],
+        'lastName' => $formData['lastName'],
+        'pan' => strtoupper($formData['pan']),
+        'dob' => $formData['dob'],
+        'email' => $formData['email'],
+        'pincode' => $formData['pincode'],
+        'monthlyIncome' => (int)$formData['monthlyIncome'],
+        'consumerConsentDate' => date('Y-m-d H:i:s'),
+        'consumerConsentIp' => getClientIP(),
+        'employmentStatus' => (int)$formData['employmentStatus']
+    ];
+
+    if (!empty($formData['creditScoreClass'])) {
+        $payload['creditScoreClass'] = (int)$formData['creditScoreClass'];
+    }
+
+    if ($formData['employmentStatus'] == 1) {
+        $payload['employerName'] = $formData['employerName'];
+        $payload['officePincode'] = $formData['officePincode'];
+    } elseif ($formData['employmentStatus'] == 2) {
+        $payload['businessRegistrationType'] = (int)$formData['businessRegistrationType'];
+
+        if ($formData['businessRegistrationType'] != 8) {
+            $payload['residenceType'] = (int)$formData['residenceType'];
+            $payload['businessCurrentTurnover'] = (int)$formData['businessCurrentTurnover'];
+            $payload['businessYears'] = (int)$formData['businessYears'];
+            $payload['businessAccount'] = (int)$formData['businessAccount'];
+        }
+    }
+
+    return makeApiRequest($createLeadUrl, 'POST', $payload);
+}
+
+// Handle form submission
+$error = null;
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    try {
+        // Validate required fields
+        if (empty($_POST['mobileNumber']) || empty($_POST['firstName']) || empty($_POST['lastName'])) {
+            throw new Exception('Please fill all required fields');
+        }
+
+        // Validate mobile number
+        if (!preg_match('/^[0-9]{10}$/', $_POST['mobileNumber'])) {
+            throw new Exception('Mobile number must be exactly 10 digits');
+        }
+
+        // Validate PAN
+        if (!preg_match('/^[A-Z]{5}[0-9]{4}[A-Z]{1}$/', strtoupper($_POST['pan']))) {
+            throw new Exception('Invalid PAN format. Use format: ABCDE1234F');
+        }
+
+        // Validate pincode
+        if (!preg_match('/^[0-9]{6}$/', $_POST['pincode'])) {
+            throw new Exception('Pincode must be exactly 6 digits');
+        }
+
+        // Validate employment status
+        if (empty($_POST['employmentStatus'])) {
+            throw new Exception('Employment status is required');
+        }
+
+        // Validate salaried fields
+        if ($_POST['employmentStatus'] == 1) {
+            if (empty($_POST['employerName'])) {
+                throw new Exception('Employer name is required');
+            }
+            if (!preg_match('/^[0-9]{6}$/', $_POST['officePincode'])) {
+                throw new Exception('Valid office pincode is required');
+            }
+        }
+
+        // Validate self-employed fields
+        if ($_POST['employmentStatus'] == 2) {
+            if (empty($_POST['businessRegistrationType'])) {
+                throw new Exception('Business registration type is required');
+            }
+
+            if ($_POST['businessRegistrationType'] != 8) {
+                if (empty($_POST['residenceType']) || empty($_POST['businessCurrentTurnover']) ||
+                    empty($_POST['businessYears']) || empty($_POST['businessAccount'])) {
+                    throw new Exception('All business details are required');
+                }
+            }
+        }
+
+        // Create lead
+        $result = createLead($_POST);
+
+        if ($result['response']['success'] === 'true' || $result['response']['success'] === true) {
+            $leadId = $result['response']['leadId'];
+
+            // Save to database
+            saveLeadToDatabase($_POST, $leadId, $result['response']);
+
+            // Save to session
+            $_SESSION['leadId'] = $leadId;
+            $_SESSION['customerName'] = $_POST['firstName'] . ' ' . $_POST['lastName'];
+
+            header('Location: offers.php?leadId=' . $leadId);
+            exit();
+        } else {
+            $error = $result['response']['message'] ?? 'Application failed';
+        }
+
+    } catch (Exception $e) {
+        $error = $e->getMessage();
+    }
+}
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Personal Loan Application - SwitchMyLoan</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+            background: #f5f5f5;
+            min-height: 100vh;
+        }
+
+        .container {
+            display: flex;
+            min-height: 100vh;
+        }
+
+        .left-panel {
+            flex: 0 0 35%;
+            background: linear-gradient(180deg, #1e6df7 0%, #e91e63 100%);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: flex-start;
+            padding: 60px 40px;
+            color: white;
+            position: relative;
+        }
+
+        .logo {
+            position: absolute;
+            top: 40px;
+            left: 40px;
+        }
+
+        .logo img {
+            max-width: 200px;
+            height: auto;
+        }
+
+        .hero-content {
+            text-align: left;
+            width: 100%;
+        }
+
+        .hero-content h1 {
+            font-size: 42px;
+            font-weight: 700;
+            margin-bottom: 20px;
+            line-height: 1.2;
+            text-align: left;
+        }
+
+        .hero-content p {
+            font-size: 18px;
+            line-height: 1.6;
+            opacity: 0.95;
+            text-align: left;
+        }
+
+        .hero-image {
+            margin-top: 40px;
+            text-align: left;
+        }
+
+        .hero-image img {
+            width: 120px;
+            animation: float 3s ease-in-out infinite;
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-20px); }
+        }
+
+        .right-panel {
+            flex: 1;
+            background: #fafafa;
+            overflow-y: auto;
+        }
+
+        .form-content {
+            padding: 60px 80px;
+            background: white;
+            margin: 0;
+            min-height: 100vh;
+        }
+
+        .alert {
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 30px;
+            border-left: 4px solid;
+        }
+
+        .alert-error {
+            background: #fee2e2;
+            border-color: #ef4444;
+            color: #991b1b;
+        }
+
+        .alert-error strong {
+            font-weight: 700;
+        }
+
+        .form-group {
+            margin-bottom: 24px;
+            position: relative;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 10px;
+            font-weight: 500;
+            color: #333;
+            font-size: 14px;
+            text-align: left;
+        }
+
+        .required {
+            color: #e91e63;
+            margin-left: 2px;
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 14px 16px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            font-size: 15px;
+            background: #f9fafb;
+            transition: all 0.3s;
+            color: #1f2937;
+            text-align: left;
+        }
+
+        .form-control:focus {
+            outline: none;
+            border-color: #1e6df7;
+            background: white;
+            box-shadow: 0 0 0 3px rgba(30, 109, 247, 0.1);
+        }
+
+        .form-control.error {
+            border-color: #ef4444;
+            background: #fef2f2;
+        }
+
+        .form-control.error:focus {
+            border-color: #ef4444;
+            box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.1);
+        }
+
+        .form-control::placeholder {
+            color: #9ca3af;
+        }
+
+        .helper-text {
+            display: block;
+            margin-top: 6px;
+            font-size: 12px;
+            color: #6b7280;
+            text-align: left;
+        }
+
+        .error-message {
+            display: none;
+            margin-top: 6px;
+            font-size: 12px;
+            color: #ef4444;
+            text-align: left;
+            font-weight: 500;
+        }
+
+        .error-message.show {
+            display: block;
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+
+        .btn {
+            background: linear-gradient(135deg, #1e6df7 0%, #e91e63 100%);
+            color: white;
+            padding: 16px 32px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            width: 100%;
+            margin-top: 20px;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(30, 109, 247, 0.3);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .conditional-field {
+            display: none;
+        }
+
+        .conditional-field.show {
+            display: block;
+        }
+
+        .checkbox-group {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 20px;
+            background: #f0f9ff;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .checkbox-group input[type="checkbox"] {
+            margin-top: 4px;
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+
+        .checkbox-group label {
+            margin: 0;
+            font-size: 13px;
+            line-height: 1.6;
+            color: #374151;
+            text-align: left;
+        }
+
+        /* Loader Styles */
+        .loader-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(8px);
+            z-index: 9999;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .loader-overlay.show {
+            display: flex;
+        }
+
+        .loader-content {
+            text-align: center;
+            background: white;
+            padding: 40px;
+            border-radius: 16px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+        }
+
+        .loader-spinner {
+            width: 60px;
+            height: 60px;
+            border: 4px solid #f3f4f6;
+            border-top: 4px solid #1e6df7;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .loader-content h3 {
+            color: #1f2937;
+            font-size: 20px;
+            margin-bottom: 10px;
+        }
+
+        .loader-content p {
+            color: #6b7280;
+            font-size: 14px;
+        }
+
+        @media (max-width: 1024px) {
+            .container {
+                flex-direction: column;
+            }
+            .left-panel {
+                flex: 0 0 auto;
+                min-height: 400px;
+            }
+            .form-content {
+                padding: 40px;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .form-row {
+                grid-template-columns: 1fr;
+            }
+            .form-content {
+                padding: 30px 20px;
+            }
+            .left-panel {
+                padding: 40px 20px;
+                align-items: center;
+            }
+            .hero-content {
+                text-align: center;
+            }
+            .hero-content h1 {
+                font-size: 32px;
+                text-align: center;
+            }
+            .hero-content p {
+                text-align: center;
+            }
+            .hero-image {
+                text-align: center;
+            }
+            .logo {
+                left: 50%;
+                transform: translateX(-50%);
+            }
+            .loader-content {
+                padding: 30px 20px;
+                margin: 0 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Loader Overlay -->
+    <div class="loader-overlay" id="loaderOverlay">
+        <div class="loader-content">
+            <div class="loader-spinner"></div>
+            <h3>Processing Your Application</h3>
+            <p>Please wait while we process your loan application...</p>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="left-panel">
+            <div class="logo">
+                <img src="logo.png" alt="Logo">
+            </div>
+            <div class="hero-content">
+                <h1>Take a New Loan</h1>
+                <p>Want us to get you the best personal loan from the sea of options available?</p>
+                <div class="hero-image">
+                    <img src="celebration.png" alt="Celebration">
+                </div>
+            </div>
+        </div>
+
+        <div class="right-panel">
+            <div class="form-content">
+                <?php if ($error): ?>
+                <div class="alert alert-error">
+                    <strong>Error:</strong> <?php echo htmlspecialchars($error); ?>
+                </div>
+                <?php endif; ?>
+
+                <form method="POST" id="loanForm" novalidate>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>First Name <span class="required">*</span></label>
+                            <input type="text" name="firstName" id="firstName" class="form-control" placeholder="John" required>
+                            <span class="error-message" id="firstNameError">Please enter your first name</span>
+                            <span class="helper-text">First name should be same as PAN card</span>
+                        </div>
+                        <div class="form-group">
+                            <label>Last Name <span class="required">*</span></label>
+                            <input type="text" name="lastName" id="lastName" class="form-control" placeholder="Doe" required>
+                            <span class="error-message" id="lastNameError">Please enter your last name</span>
+                            <span class="helper-text">Last name should be same as PAN card</span>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Mobile No <span class="required">*</span></label>
+                            <input type="tel" name="mobileNumber" id="mobileNumber" class="form-control" placeholder="9999999999" required>
+                            <span class="error-message" id="mobileNumberError">Please enter a valid 10-digit mobile number</span>
+                            <span class="helper-text">Mobile number must be linked to PAN card</span>
+                        </div>
+                        <div class="form-group">
+                            <label>Email ID <span class="required">*</span></label>
+                            <input type="email" name="email" id="email" class="form-control" placeholder="john@example.com" required>
+                            <span class="error-message" id="emailError">Please enter a valid email address</span>
+                            <span class="helper-text">Email address must be linked to PAN card</span>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>PAN No <span class="required">*</span></label>
+                            <input type="text" name="pan" id="pan" class="form-control" placeholder="ABCEF0000X" style="text-transform: uppercase;" required maxlength="10">
+                            <span class="error-message" id="panError">Please enter a valid PAN (e.g., ABCDE1234F)</span>
+                            <span class="helper-text">Please enter PAN in capital letters <strong>Eg. ABCEF0000X</strong></span>
+                        </div>
+                        <div class="form-group">
+                            <label>Date of Birth <span class="required">*</span></label>
+                            <input type="date" name="dob" id="dob" class="form-control" required>
+                            <span class="error-message" id="dobError">You must be at least 18 years old</span>
+                            <span class="helper-text">Date of Birth should be same as PAN Card</span>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Profile <span class="required">*</span></label>
+                            <select name="employmentStatus" id="employmentStatus" class="form-control" required>
+                                <option value="">Select</option>
+                                <option value="1">Salaried</option>
+                                <option value="2">Self Employed</option>
+                            </select>
+                            <span class="error-message" id="employmentStatusError">Please select your employment profile</span>
+                            <span class="helper-text">Select your employment profile</span>
+                        </div>
+                        <div class="form-group">
+                            <label>Monthly Income <span class="required">*</span></label>
+                            <input type="number" name="monthlyIncome" id="monthlyIncome" class="form-control" placeholder="50000" required min="1">
+                            <span class="error-message" id="monthlyIncomeError">Please enter your monthly income</span>
+                            <span class="helper-text">Monthly income as per payslip</span>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Pin Code <span class="required">*</span></label>
+                            <input type="text" name="pincode" id="pincode" class="form-control" placeholder="110001" required maxlength="6">
+                            <span class="error-message" id="pincodeError">Please enter a valid 6-digit pincode</span>
+                            <span class="helper-text">Enter Postal code <strong>Eg. 110001</strong></span>
+                        </div>
+                        <div class="form-group">
+                            <label>Loan Type</label>
+                            <select name="loanType" id="loanType" class="form-control">
+                                <option value="">Select</option>
+                                <option value="travel">Travel</option>
+                                <option value="home_renovation">Home Renovation</option>
+                                <option value="medical">Medical</option>
+                                <option value="education">Education</option>
+                                <option value="wedding">Wedding</option>
+                                <option value="other">Other</option>
+                            </select>
+                            <span class="helper-text">Select the purpose of the loan</span>
+                        </div>
+                    </div>
+
+                    <!-- Salaried Fields -->
+                    <div id="salariedFields" class="conditional-field">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Employer Name <span class="required">*</span></label>
+                                <input type="text" name="employerName" id="employerName" class="form-control" placeholder="Company Name">
+                                <span class="error-message" id="employerNameError">Please enter your employer name</span>
+                                <span class="helper-text">Enter your current employer name</span>
+                            </div>
+                            <div class="form-group">
+                                <label>Office Pincode <span class="required">*</span></label>
+                                <input type="text" name="officePincode" id="officePincode" class="form-control" placeholder="110001" maxlength="6">
+                                <span class="error-message" id="officePincodeError">Please enter a valid 6-digit office pincode</span>
+                                <span class="helper-text">Office location pincode (6 digits)</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Self Employed Fields -->
+                    <div id="selfEmployedFields" class="conditional-field">
+                        <div class="form-group">
+                            <label>Business Registration Type <span class="required">*</span></label>
+                            <select name="businessRegistrationType" id="businessRegistrationType" class="form-control">
+                                <option value="">Select</option>
+                                <option value="1">GST</option>
+                                <option value="2">Shop & Establishment</option>
+                                <option value="3">Municipal Corporation</option>
+                                <option value="4">Palika Gramapanchayat</option>
+                                <option value="5">Udyog Aadhar</option>
+                                <option value="6">Drugs License</option>
+                                <option value="7">Other</option>
+                                <option value="8">No Business Proof</option>
+                            </select>
+                            <span class="error-message" id="businessRegistrationTypeError">Please select business registration type</span>
+                            <span class="helper-text">Select your business registration type</span>
+                        </div>
+
+                        <div id="businessDetailsFields" class="conditional-field">
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Residence Type <span class="required">*</span></label>
+                                    <select name="residenceType" id="residenceType" class="form-control">
+                                        <option value="">Select</option>
+                                        <option value="1">Rented</option>
+                                        <option value="2">Owned</option>
+                                    </select>
+                                    <span class="error-message" id="residenceTypeError">Please select your residence type</span>
+                                    <span class="helper-text">Your current residence type</span>
+                                </div>
+                                <div class="form-group">
+                                    <label>Business Turnover <span class="required">*</span></label>
+                                    <select name="businessCurrentTurnover" id="businessCurrentTurnover" class="form-control">
+                                        <option value="">Select</option>
+                                        <option value="1">Up to 6 lacs</option>
+                                        <option value="2">6-12 lacs</option>
+                                        <option value="3">12-20 lacs</option>
+                                        <option value="4">Above 20 lacs</option>
+                                    </select>
+                                    <span class="error-message" id="businessCurrentTurnoverError">Please select business turnover</span>
+                                    <span class="helper-text">Annual business turnover</span>
+                                </div>
+                            </div>
+
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Years in Business <span class="required">*</span></label>
+                                    <select name="businessYears" id="businessYears" class="form-control">
+                                        <option value="">Select</option>
+                                        <option value="1">Less than 1 year</option>
+                                        <option value="2">1-2 years</option>
+                                        <option value="3">More than 2 years</option>
+                                    </select>
+                                    <span class="error-message" id="businessYearsError">Please select years in business</span>
+                                    <span class="helper-text">Years of business operation</span>
+                                </div>
+                                <div class="form-group">
+                                    <label>Business Current Account? <span class="required">*</span></label>
+                                    <select name="businessAccount" id="businessAccount" class="form-control">
+                                        <option value="">Select</option>
+                                        <option value="1">Yes</option>
+                                        <option value="2">No</option>
+                                    </select>
+                                    <span class="error-message" id="businessAccountError">Please select if you have business account</span>
+                                    <span class="helper-text">Do you have a business current account?</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="consent" required>
+                        <label for="consent">
+                            You hereby consent to SwitchMyLoan being appointed as your authorised representative to receive your Credit Information from Experian/CIBIL/EQUIFAX/CRIF for the purpose of Credit Assessment of the End User to Advise him on the best loan offers (End Use Purpose) or expiry of 6 months from the date the consent is collected; whichever is earlier.
+                        </label>
+                    </div>
+                    <span class="error-message" id="consentError">Please accept the terms and conditions</span>
+
+                    <button type="submit" class="btn">Submit Application</button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Set max date for DOB (18 years ago from today)
+        const dobInput = document.getElementById('dob');
+        const today = new Date();
+        const maxDate = new Date(today.getFullYear() - 18, today.getMonth(), today.getDate());
+        const maxDateString = maxDate.toISOString().split('T')[0];
+        dobInput.max = maxDateString;
+
+        // Validation functions
+        function showError(fieldId, message) {
+            const field = document.getElementById(fieldId);
+            const errorElement = document.getElementById(fieldId + 'Error');
+            field.classList.add('error');
+            if (errorElement) {
+                if (message) errorElement.textContent = message;
+                errorElement.classList.add('show');
+            }
+        }
+
+        function hideError(fieldId) {
+            const field = document.getElementById(fieldId);
+            const errorElement = document.getElementById(fieldId + 'Error');
+            field.classList.remove('error');
+            if (errorElement) {
+                errorElement.classList.remove('show');
+            }
+        }
+
+        function validateField(field) {
+            const fieldId = field.id;
+            const value = field.value.trim();
+
+            switch(fieldId) {
+                case 'firstName':
+                case 'lastName':
+                    if (!value) {
+                        showError(fieldId, 'This field is required');
+                        return false;
+                    } else if (!/^[a-zA-Z\s]+$/.test(value)) {
+                        showError(fieldId, 'Only letters are allowed');
+                        return false;
+                    }
+                    break;
+
+                case 'mobileNumber':
+                    if (!value) {
+                        showError(fieldId, 'Mobile number is required');
+                        return false;
+                    } else if (!/^[0-9]{10}$/.test(value)) {
+                        showError(fieldId, 'Please enter a valid 10-digit mobile number');
+                        return false;
+                    }
+                    break;
+
+                case 'email':
+                    if (!value) {
+                        showError(fieldId, 'Email is required');
+                        return false;
+                    } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
+                        showError(fieldId, 'Please enter a valid email address');
+                        return false;
+                    }
+                    break;
+
+                case 'pan':
+                    if (!value) {
+                        showError(fieldId, 'PAN is required');
+                        return false;
+                    } else if (!/^[A-Z]{5}[0-9]{4}[A-Z]{1}$/.test(value)) {
+                        showError(fieldId, 'Invalid PAN format (e.g., ABCDE1234F)');
+                        return false;
+                    }
+                    break;
+
+                case 'dob':
+                    if (!value) {
+                        showError(fieldId, 'Date of birth is required');
+                        return false;
+                    } else {
+                        const dob = new Date(value);
+                        const age = (today - dob) / (365.25 * 24 * 60 * 60 * 1000);
+                        if (age < 18) {
+                            showError(fieldId, 'You must be at least 18 years old');
+                            return false;
+                        }
+                    }
+                    break;
+
+                case 'pincode':
+                case 'officePincode':
+                    if (!value) {
+                        showError(fieldId, 'Pincode is required');
+                        return false;
+                    } else if (!/^[0-9]{6}$/.test(value)) {
+                        showError(fieldId, 'Please enter a valid 6-digit pincode');
+                        return false;
+                    }
+                    break;
+
+                case 'monthlyIncome':
+                    if (!value || value <= 0) {
+                        showError(fieldId, 'Please enter a valid monthly income');
+                        return false;
+                    }
+                    break;
+
+                case 'employmentStatus':
+                case 'businessRegistrationType':
+                case 'residenceType':
+                case 'businessCurrentTurnover':
+                case 'businessYears':
+                case 'businessAccount':
+                    if (!value) {
+                        showError(fieldId, 'Please select an option');
+                        return false;
+                    }
+                    break;
+
+                case 'employerName':
+                    if (!value) {
+                        showError(fieldId, 'Employer name is required');
+                        return false;
+                    }
+                    break;
+            }
+
+            hideError(fieldId);
+            return true;
+        }
+
+        // Add blur event listeners to all form fields
+        const formFields = [
+            'firstName', 'lastName', 'mobileNumber', 'email', 'pan', 'dob',
+            'employmentStatus', 'monthlyIncome', 'pincode', 'employerName',
+            'officePincode', 'businessRegistrationType', 'residenceType',
+            'businessCurrentTurnover', 'businessYears', 'businessAccount'
+        ];
+
+        formFields.forEach(fieldId => {
+            const field = document.getElementById(fieldId);
+            if (field) {
+                field.addEventListener('blur', () => validateField(field));
+                field.addEventListener('input', () => {
+                    if (field.classList.contains('error')) {
+                        validateField(field);
+                    }
+                });
+            }
+        });
+
+        // Employment status change handler
+        const employmentStatus = document.getElementById('employmentStatus');
+        if (employmentStatus) {
+            employmentStatus.addEventListener('change', function() {
+                document.getElementById('salariedFields').classList.remove('show');
+                document.getElementById('selfEmployedFields').classList.remove('show');
+
+                // Clear conditional field errors
+                hideError('employerName');
+                hideError('officePincode');
+                hideError('businessRegistrationType');
+                hideError('residenceType');
+                hideError('businessCurrentTurnover');
+                hideError('businessYears');
+                hideError('businessAccount');
+
+                if (this.value == '1') {
+                    document.getElementById('salariedFields').classList.add('show');
+                } else if (this.value == '2') {
+                    document.getElementById('selfEmployedFields').classList.add('show');
+                }
+            });
+        }
+
+        // Business registration type change handler
+        const businessReg = document.getElementById('businessRegistrationType');
+        if (businessReg) {
+            businessReg.addEventListener('change', function() {
+                const details = document.getElementById('businessDetailsFields');
+                
+                // Clear business detail errors
+                hideError('residenceType');
+                hideError('businessCurrentTurnover');
+                hideError('businessYears');
+                hideError('businessAccount');
+
+                if (this.value != '8' && this.value != '') {
+                    details.classList.add('show');
+                } else {
+                    details.classList.remove('show');
+                }
+            });
+        }
+
+        // PAN uppercase converter
+        const panInput = document.getElementById('pan');
+        if (panInput) {
+            panInput.addEventListener('input', function() {
+                this.value = this.value.toUpperCase();
+            });
+        }
+
+        // Only allow numbers in mobile and pincode fields
+        ['mobileNumber', 'pincode', 'officePincode'].forEach(fieldId => {
+            const field = document.getElementById(fieldId);
+            if (field) {
+                field.addEventListener('input', function() {
+                    this.value = this.value.replace(/[^0-9]/g, '');
+                });
+            }
+        });
+
+        // Form submission validation
+        document.getElementById('loanForm').addEventListener('submit', function(e) {
+            e.preventDefault(); // Prevent default submission
+            
+            let isValid = true;
+            
+            // Validate basic fields
+            const basicFields = ['firstName', 'lastName', 'mobileNumber', 'email', 'pan', 'dob', 'employmentStatus', 'monthlyIncome', 'pincode'];
+            basicFields.forEach(fieldId => {
+                const field = document.getElementById(fieldId);
+                if (field && !validateField(field)) {
+                    isValid = false;
+                }
+            });
+
+            // Validate employment-specific fields
+            const empStatus = document.getElementById('employmentStatus').value;
+            if (empStatus == '1') {
+                if (!validateField(document.getElementById('employerName'))) isValid = false;
+                if (!validateField(document.getElementById('officePincode'))) isValid = false;
+            } else if (empStatus == '2') {
+                if (!validateField(document.getElementById('businessRegistrationType'))) isValid = false;
+                
+                const busRegType = document.getElementById('businessRegistrationType').value;
+                if (busRegType && busRegType != '8') {
+                    if (!validateField(document.getElementById('residenceType'))) isValid = false;
+                    if (!validateField(document.getElementById('businessCurrentTurnover'))) isValid = false;
+                    if (!validateField(document.getElementById('businessYears'))) isValid = false;
+                    if (!validateField(document.getElementById('businessAccount'))) isValid = false;
+                }
+            }
+
+            // Validate consent checkbox
+            const consent = document.getElementById('consent');
+            const consentError = document.getElementById('consentError');
+            if (!consent.checked) {
+                consentError.classList.add('show');
+                isValid = false;
+            } else {
+                consentError.classList.remove('show');
+            }
+
+            if (!isValid) {
+                // Scroll to first error
+                const firstError = document.querySelector('.form-control.error');
+                if (firstError) {
+                    firstError.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    firstError.focus();
+                }
+            } else {
+                // Show loader
+                document.getElementById('loaderOverlay').classList.add('show');
+                
+                // Submit the form
+                this.submit();
+            }
+        });
+    </script>
+</body>
+</html>
